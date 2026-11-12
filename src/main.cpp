@@ -620,7 +620,10 @@ static void startAP() {
 static void exitAP() {
     if (!apMode) return;
     apMode = false;
-    server.close();   // free the port-80 listener (begin() re-creates it on reopen)
+    // Keep the port-80 listener up: the same routes serve the phone UI and the
+    // agent's curl (POST /test, /config?mirror=…) for the rest of the day. Only
+    // the access point itself goes away, so the board is still reachable at its
+    // home-WiFi address and http://garagesense.local.
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(true);   // let the radio modem-sleep in normal operation (power/heat)
@@ -995,8 +998,8 @@ void loop() {
         delay(50);
     }
 
-    // --- config web UI (AP mode only) ---
-    if (apMode) server.handleClient();
+    // --- web UI: always on (the AP window only gates the access point itself) ---
+    if (apMode || WiFi.isConnected()) server.handleClient();
 
     // --- config window expired -> drop the AP (board stays on home WiFi) ---
     if (apMode && (millis() - apStartMs >= cfg.apWindowMs)) {
