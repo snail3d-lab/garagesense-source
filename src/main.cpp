@@ -1,0 +1,1111 @@
+// GARAGESENSE v1 — garage door monitor on the Seeed XIAO ESP32S3 Sense
+//
+// Pipeline:
+//   PDM mic (GPIO41/42) -> 16 kHz PCM -> sustained-envelope detector
+//   motor runs >= DOOR_MIN_MS then stops  ->  door event
+//   door event + DOOR_PHOTO_DELAY_MS -> capture JPEG -> Telegram sendPhoto
+//
+// Cooldown: at most one photo per cfg.cooldownMs. A door cycle is one event.
+//
+// Config: for the first 10 minutes after power-on the board broadcasts an open AP
+// "garagesense-config" and serves a web UI (http://garagesense.local) to tune
+// sensitivity, cooldown, WiFi and Telegram settings —
+// persisted in NVS across reboots.
+//
+// Serial commands (115200):
+//   t  force a test photo + Telegram send (bypasses detector and cooldown)
+//   s  print status (mode, noise floor, threshold, last frame level, cooldown)
+//   c  clear the cooldown so the next door event sends immediately
+//   1  raise detection threshold by 2 dB (fewer triggers)
+//   2  lower detection threshold by 2 dB (more triggers)
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <esp_camera.h>
+#include <driver/i2s.h>
+#include <time.h>
+#include <esp_heap_caps.h>
+#include <mbedtls/base64.h>
+
+#include "config.h"
+#include "credentials.h"
+#include "door_detector.h"
+#include "telegram_ca.h"
+#include "ui_page.h"
+
+// ============================ runtime config (NVS-persisted)
+
+struct AppConfig {
+    String ssid, pass;
+    String botToken, chatId;
+    float marginDb;       // sensitivity: door threshold = noise floor + margin
+    uint32_t cooldownMs;  // max one photo per this many ms (fixed at COOLDOWN_MS)
+    int rotate;           // photo orientation: 0=none 3=180 (90° not supported by this camera)
+    int exposure;         // photo brightness: 0=dim 1=medium 2=bright
+    int mirror;           // 1 = horizontal mirror (fixes a reversed view)
+    uint32_t apWindowMs;  // config-AP window at boot (default 10 min)
+    uint8_t daysMask;     // quiet-hours: which days are on (bit0=Mon..bit6=Sun)
+    uint32_t hoursMask;   // quiet-hours: bit N set = on during hour N (0=midnight)
+};
+
+static AppConfig cfg = {
+    WIFI_SSID, WIFI_PASSWORD,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    THRESHOLD_MARGIN_DB, COOLDOWN_MS, CAM_ROTATE_DEFAULT, CAM_EXPOSURE_DEFAULT,
+    CAM_MIRROR_DEFAULT, AP_WINDOW_MS,
+    SCHED_DAYS_DEFAULT, SCHED_HOURS_DEFAULT
+};
+
+static Preferences prefs;   // namespace "garagesense" (opened in loadConfig)
+
+// One-time NVS migration: the firmware shipped as "garagecam" before the rename.
+// A board flashed with an app-only image keeps its NVS, so copy the old namespace
+// across rather than making the owner re-enter WiFi and re-learn the door.
+static void migrateOldNamespace() {
+    if (prefs.isKey("ssid") || prefs.isKey("tmplLen")) return;   // already migrated
+    Preferences old;
+    if (!old.begin("garagecam", true)) return;
+    static const char *keys[] = {"ssid", "pass", "token", "chatId", "margin", "rotate",
+                                 "exposure", "mirror", "apWindow", "daysMask", "hoursMask",
+                                 "schedFrom", "schedTo", "tmpl", "tmplLen"};
+    size_t copied = 0;
+    for (const char *k : keys) {
+        if (!old.isKey(k)) continue;
+        size_t n = old.getBytesLength(k);
+        uint8_t *buf = (uint8_t *)malloc(n);
+        if (!buf) continue;
+        old.getBytes(k, buf, n);
+        prefs.putBytes(k, buf, n);
+        free(buf);
+        copied++;
+    }
+    old.end();
+    if (copied) Serial.printf("config: migrated %u keys from the old garagecam namespace\n",
+                              (unsigned)copied);
+}
+
+static void loadConfig() {
+    prefs.begin("garagesense", false);   // read-write; saves reuse the same handle
+    migrateOldNamespace();
+    if (prefs.isKey("ssid"))     { String v = prefs.getString("ssid", "");   if (v.length()) cfg.ssid = v; }
+    if (prefs.isKey("pass"))     { String v = prefs.getString("pass", "");   if (v.length()) cfg.pass = v; }
+    if (prefs.isKey("token"))    { String v = prefs.getString("token", "");  if (v.length()) cfg.botToken = v; }
+    if (prefs.isKey("chatId"))   { String v = prefs.getString("chatId", ""); if (v.length()) cfg.chatId = v; }
+    if (prefs.isKey("margin"))   cfg.marginDb = prefs.getFloat("margin", THRESHOLD_MARGIN_DB);
+    if (prefs.isKey("rotate"))   { int r = prefs.getInt("rotate", CAM_ROTATE_DEFAULT); cfg.rotate = (r == 0 || r == 3) ? r : CAM_ROTATE_DEFAULT; }
+    if (prefs.isKey("exposure")) cfg.exposure = prefs.getInt("exposure", CAM_EXPOSURE_DEFAULT);
+    if (prefs.isKey("mirror"))   cfg.mirror = prefs.getInt("mirror", CAM_MIRROR_DEFAULT) ? 1 : 0;
+    if (prefs.isKey("apWindow")) cfg.apWindowMs = prefs.getInt("apWindow", AP_WINDOW_MS);
+    if (prefs.isKey("daysMask")) { int v = prefs.getInt("daysMask", SCHED_DAYS_DEFAULT); cfg.daysMask = (uint8_t)(v & 0x7F); }
+    if (prefs.isKey("hoursMask")) cfg.hoursMask = (uint32_t)(prefs.getInt("hoursMask", (int)SCHED_HOURS_DEFAULT) & 0xFFFFFFu);
+    else if (prefs.isKey("schedFrom") || prefs.isKey("schedTo")) {
+        // Upgrade path: a pre-v1.1 board stored an inclusive from/to window —
+        // convert it to the per-hour mask so the user's schedule survives.
+        int from = prefs.getInt("schedFrom", 0);   from = (from >= 0 && from <= 23) ? from : 0;
+        int to   = prefs.getInt("schedTo", 23);    to   = (to >= 0 && to <= 23) ? to : 23;
+        uint32_t m = 0;
+        if (from == to) m = SCHED_HOURS_DEFAULT;
+        else if (from < to) { for (int h = from; h <= to; h++) m |= 1u << h; }
+        else { for (int h = from; h < 24; h++) m |= 1u << h; for (int h = 0; h <= to; h++) m |= 1u << h; }
+        cfg.hoursMask = m;
+    }
+}
+
+static void saveConfig() {
+    prefs.putString("ssid", cfg.ssid);
+    prefs.putString("pass", cfg.pass);
+    prefs.putString("token", cfg.botToken);
+    prefs.putString("chatId", cfg.chatId);
+    prefs.putFloat("margin", cfg.marginDb);
+    prefs.putInt("rotate", cfg.rotate);
+    prefs.putInt("exposure", cfg.exposure);
+    prefs.putInt("mirror", cfg.mirror);
+    prefs.putInt("apWindow", (int)cfg.apWindowMs);
+    prefs.putInt("daysMask", (int)cfg.daysMask);
+    prefs.putInt("hoursMask", (int)cfg.hoursMask);
+}
+
+// ============================ globals
+
+static const i2s_port_t I2S_PORT = I2S_NUM_0;
+static bool micReady = false;
+static bool cameraReady = false;
+static DoorDetector detector;
+
+// The learned door envelope lives in NVS as a blob. Written on learn-commit,
+// read at boot, so the camera keeps knowing its own door across reboots.
+static void saveTemplate() {
+    int n = detector.templateLen();
+    if (n <= 8) { prefs.remove("tmplLen"); return; }
+    prefs.putBytes("tmpl", detector.templateBuf(), (size_t)n * sizeof(float));
+    prefs.putInt("tmplLen", n);
+}
+
+static void loadTemplate() {
+    int n = prefs.getInt("tmplLen", 0);
+    if (n <= 8) return;
+    size_t want = (size_t)n * sizeof(float);
+    if (prefs.getBytesLength("tmpl") != want) return;
+    float buf[DoorDetector::TEMPLATE_LEN];
+    if (n > DoorDetector::TEMPLATE_LEN) return;
+    prefs.getBytes("tmpl", buf, want);
+    detector.loadTemplate(buf, n);
+    Serial.printf("learned door template loaded (%d samples)\n", n);
+}
+
+static uint32_t lastSendMs = 0;          // cooldown anchor
+static uint32_t lastEventMs = 0;         // last confirmed door event (episode tracking)
+static uint8_t episodeCount = 0;         // successful photos sent during the current episode
+static volatile uint32_t loopTick = 0;   // watchdog ping
+static bool working = false;             // LED solid while capturing/sending
+
+// config access point state
+static WebServer server(80);
+static bool apMode = false;
+static uint32_t apStartMs = 0;
+static uint32_t staDiscSince = 0;
+static bool everConnected = false;
+// Auto-exit (polled in loop): once a phone has connected, when the last one
+// leaves, close the AP after 10 s (debounce against transient drops). No
+// client ever connected -> apEmptySince stays 0, the 10-min window rules.
+static uint32_t apEmptySince = 0;
+static bool apClientEver = false;
+
+// web test request (handler sets the flag, loop does the work)
+static volatile bool pendingTest = false;
+static String lastResult = "none";       // none | ok | fail
+
+#define LED_ON()  digitalWrite(LED_PIN, LOW)   // active-LOW
+#define LED_OFF() digitalWrite(LED_PIN, HIGH)
+
+// ============================ helpers
+
+static void *bigMalloc(size_t n) {
+#if CONFIG_SPIRAM || defined(BOARD_HAS_PSRAM)
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) return p;
+#endif
+    return malloc(n);
+}
+
+// ============================ microphone (PDM via I2S)
+
+static bool initMic() {
+    i2s_config_t cfg = {};
+    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
+    cfg.sample_rate          = SAMPLE_RATE;
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_RIGHT;   // single PDM mic
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count        = 4;
+    cfg.dma_buf_len          = 256;
+    cfg.use_apll             = true;
+    if (i2s_driver_install(I2S_PORT, &cfg, 0, NULL) != ESP_OK) return false;
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num   = I2S_PIN_NO_CHANGE;              // PDM doesn't use BCLK
+    pins.ws_io_num    = MIC_PDM_CLK;                    // PDM clock  (GPIO42)
+    pins.data_out_num = I2S_PIN_NO_CHANGE;
+    pins.data_in_num  = MIC_PDM_DATA;                   // PDM data   (GPIO41)
+    return i2s_set_pin(I2S_PORT, &pins) == ESP_OK;
+}
+
+// ============================ camera (lazy — only on first door event)
+
+// Apply the configured photo orientation + exposure to the sensor hardware.
+// This install is mounted upside-down, so the "180°" setting corrects it with a
+// vertical flip only. We never mirror (hmirror stays off) — a full 180° flip would
+// also mirror the image, which reads as a mirror-image on this camera.
+static void applyCameraTuning() {
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s) return;
+    int flip = (cfg.rotate == 3) ? 1 : 0;   // 180° = vertical flip (upside-down fix)
+    s->set_vflip(s, flip);
+    // Horizontal mirror is now CONFIGURABLE (2026-11-10): Eric's install reads
+    // reversed, so mirror is on by default. The OV2640 does this in hardware.
+    s->set_hmirror(s, cfg.mirror ? 1 : 0);
+    // Auto-exposure + auto-gain: this install is fixed on a window, so light
+    // varies all day — let the sensor adapt (AEC/AGC) instead of a fixed exposure.
+    // NOTE: the OV2640 has no plain "set_aec" — AEC enable is set_exposure_ctrl.
+    s->set_exposure_ctrl(s, 1);   // AEC on
+    s->set_gain_ctrl(s, 1);       // AGC on
+    // dim/medium/bright bias the AEC target over the sensor's real -2..+2 range.
+    static const int8_t EXPO_LV[] = { -2, 0, 2 };
+    int e = cfg.exposure; if (e < 0) e = 0; else if (e > 2) e = 2;
+    int lv = EXPO_LV[e];
+    s->set_ae_level(s, lv);
+    s->set_brightness(s, lv);
+}
+
+static bool initCamera() {
+    camera_config_t c = {};
+    c.ledc_channel = LEDC_CHANNEL_0;
+    c.ledc_timer   = LEDC_TIMER_0;
+    c.pin_d0  = CAM_PIN_D0;   c.pin_d1  = CAM_PIN_D1;
+    c.pin_d2  = CAM_PIN_D2;   c.pin_d3  = CAM_PIN_D3;
+    c.pin_d4  = CAM_PIN_D4;   c.pin_d5  = CAM_PIN_D5;
+    c.pin_d6  = CAM_PIN_D6;   c.pin_d7  = CAM_PIN_D7;
+    c.pin_xclk   = CAM_PIN_XCLK;
+    c.pin_pclk   = CAM_PIN_PCLK;
+    c.pin_vsync  = CAM_PIN_VSYNC;
+    c.pin_href   = CAM_PIN_HREF;
+    c.pin_sccb_sda = CAM_PIN_SDA;
+    c.pin_sccb_scl = CAM_PIN_SCL;
+    c.pin_pwdn  = -1;
+    c.pin_reset = -1;
+    c.xclk_freq_hz = 20000000;
+    c.pixel_format = PIXFORMAT_JPEG;
+    c.frame_size   = FRAMESIZE_VGA;      // 640x480 — small file, fast capture
+    c.jpeg_quality = CAM_JPEG_QUALITY;   // 12 ≈ 30–60 KB
+    c.fb_count     = 2;
+    c.grab_mode    = CAMERA_GRAB_LATEST;
+
+    if (esp_camera_init(&c) != ESP_OK) return false;
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        applyCameraTuning();   // vflip/hmirror per cfg.rotate + brightness per cfg.exposure
+        s->set_contrast(s, 2);
+        s->set_saturation(s, -1);        // pull down the green cast
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
+        s->set_wb_mode(s, 1);            // "sunny" — good for outdoors
+        s->set_lenc(s, 1);               // lens correction
+    }
+    cameraReady = true;
+    Serial.println("camera ready (VGA q12)");
+    return true;
+}
+
+// EXIF orientation segments for the 90° rotations (the OV2640 can't rotate in
+// hardware). One IFD entry with the Orientation tag, inserted right after the
+// SOI marker; viewers (Telegram included) apply it when displaying.
+static const uint8_t exif_o6[40] = {   // 90° CW
+    0xFF, 0xE1, 0x26, 0x00,           // APP1 marker, length 38
+    'E', 'x', 'i', 'f', 0, 0,         // "Exif\0\0"
+    0x49, 0x49, 0x2A, 0x00,           // little-endian TIFF, magic 42
+    0x08, 0x00, 0x00, 0x00,           // IFD offset
+    0x01, 0x00,                       // one entry
+    0x12, 0x01, 0x00, 0x00,           // tag 0x0112 (Orientation)
+    0x03, 0x00, 0x00, 0x00,           // type SHORT
+    0x01, 0x00, 0x00, 0x00,           // count = 1
+    0x06, 0x00, 0x00, 0x00,           // value = 6
+    0x00, 0x00, 0x00, 0x00            // next IFD = none
+};
+static const uint8_t exif_o8[40] = {   // 90° CCW
+    0xFF, 0xE1, 0x26, 0x00,           // APP1 marker, length 38
+    'E', 'x', 'i', 'f', 0, 0,         // "Exif\0\0"
+    0x49, 0x49, 0x2A, 0x00,           // little-endian TIFF, magic 42
+    0x08, 0x00, 0x00, 0x00,           // IFD offset
+    0x01, 0x00,                       // one entry
+    0x12, 0x01, 0x00, 0x00,           // tag 0x0112 (Orientation)
+    0x03, 0x00, 0x00, 0x00,           // type SHORT
+    0x01, 0x00, 0x00, 0x00,           // count = 1
+    0x08, 0x00, 0x00, 0x00,           // value = 8
+    0x00, 0x00, 0x00, 0x00            // next IFD = none
+};
+
+static bool injectExif(const uint8_t *in, size_t inLen, const uint8_t *tpl, uint8_t **out, size_t *outLen) {
+    if (inLen < 2 || in[0] != 0xFF || in[1] != 0xD8) return false;   // not a JPEG
+    size_t total = inLen + 40;
+    uint8_t *buf = (uint8_t *)bigMalloc(total);
+    if (!buf) return false;
+    memcpy(buf, in, 2);                        // SOI
+    memcpy(buf + 2, tpl, 40);                  // EXIF APP1 segment
+    memcpy(buf + 42, in + 2, inLen - 2);       // rest of the JPEG
+    *out = buf;                                // fresh allocation — caller frees
+    *outLen = total;
+    return true;
+}
+
+static bool capturePhoto(uint8_t **out, size_t *outLen) {
+    if (!cameraReady && !initCamera()) {
+        Serial.println("!! camera init failed — is the Sense expansion attached? !!");
+        return false;
+    }
+    if (!cameraReady) return false;
+
+    // Let AEC/AGC converge on the current scene: grab and discard a few frames
+    // so the auto-exposure settles before we capture the real one.
+    for (int i = 0; i < AEC_SETTLE_FRAMES; i++) {
+        camera_fb_t *warm = esp_camera_fb_get();
+        if (warm) esp_camera_fb_return(warm);
+        else break;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { Serial.println("camera: no frame"); return false; }
+
+    bool ok = false;
+    if (cfg.rotate == 1 || cfg.rotate == 2) {
+        // 90° rotation: hardware can't do it — tag the JPEG with EXIF orientation
+        uint8_t *buf = nullptr;
+        size_t len = 0;
+        if (injectExif(fb->buf, fb->len, (cfg.rotate == 1) ? exif_o6 : exif_o8, &buf, &len)) {
+            *out = buf; *outLen = len; ok = true;
+        } else {
+            Serial.println("exif inject failed — sending raw frame");
+        }
+    }
+    if (!ok) {
+        // 0° (raw) or 180° (already flipped in sensor hardware): copy the frame
+        uint8_t *buf = (uint8_t *)bigMalloc(fb->len);
+        if (buf) { memcpy(buf, fb->buf, fb->len); *out = buf; *outLen = fb->len; ok = true; }
+    }
+    esp_camera_fb_return(fb);
+
+    if (ok) Serial.printf("photo ready (%u KB, rot=%d)\n", (unsigned)(*outLen / 1024), cfg.rotate);
+    else Serial.println("!! photo capture failed !!");
+    return ok;
+}
+
+// ============================ time (NTP, for captions)
+
+static void initTime() {
+    configTime(TZ_OFFSET_HOURS * 3600, 0, "0.us.pool.ntp.org", "1.us.pool.ntp.org");
+}
+
+static String clockString() {
+    time_t t = time(nullptr);
+    if (t < 1600000000) return String();   // NTP not synced yet
+    struct tm lt;
+    localtime_r(&t, &lt);
+    char b[16];
+    strftime(b, sizeof(b), "%H:%M:%S", &lt);
+    return String(b);
+}
+
+// ============================ telegram: manual trigger
+//
+// Eric: "I'd like to be able to manually trigger a photo from Telegram".
+// Long-polls getUpdates (only when idle) for /photo (or /garage, /snap) and
+// raises the same delayed-capture path as a real door event. The agent skill
+// can also just POST to the board — see the /snap web route below.
+
+static void handleDoorEvent(const char *why, bool force);   // fwd decl
+
+static volatile bool pendingTelegramPhoto = false;
+static long lastUpdateId = 0;
+static uint32_t lastPollMs = 0;
+
+static void pollTelegramTrigger() {
+    if (millis() - lastPollMs < 3000) return;
+    lastPollMs = millis();
+
+    WiFiClientSecure c;
+    c.setCACert(TELEGRAM_ROOT_CA);
+    c.setTimeout(6000);
+    HTTPClient http;
+    String url = String("https://api.telegram.org/bot") + cfg.botToken +
+                 "/getUpdates?timeout=0&allowed_updates=[\"message\"]";
+    if (lastUpdateId) url += "&offset=" + String(lastUpdateId + 1);
+    if (!http.begin(c, url)) return;
+    int code = http.GET();
+    if (code == 200) {
+        String body = http.getString();
+        // Telegram escapes JSON; the text we want is  "text":"/photo"
+        int cmdAt = body.indexOf("\"text\":\"");
+        while (cmdAt >= 0) {
+            int st = cmdAt + 8;
+            int en = body.indexOf('"', st);
+            if (en < 0) break;
+            String text = body.substring(st, en);
+            text.trim();
+            if (text.startsWith("/photo") || text.startsWith("/snap") ||
+                text.startsWith("/garage")) {
+                Serial.printf("TELEGRAM: got \"%s\" -> taking a photo\n", text.c_str());
+                pendingTelegramPhoto = true;
+                break;
+            }
+            cmdAt = body.indexOf("\"text\":\"", en);
+        }
+        // Always advance past everything we just read, so old commands are not
+        // replayed on the next poll.
+        int lastIdAt = body.lastIndexOf("\"update_id\":");
+        if (lastIdAt >= 0) {
+            long v = body.substring(lastIdAt + 12).toInt();
+            if (v > lastUpdateId) lastUpdateId = v;
+        }
+    } else {
+        Serial.printf("TELEGRAM poll HTTP %d\n", code);
+    }
+    if (code == 200) { static int n=0; if (++n % 10 == 1) Serial.printf("TELEGRAM poll ok, lastId=%ld\n", lastUpdateId); }
+    http.end();
+    c.stop();
+}
+
+// ============================ telegram
+
+static bool sendTelegramPhoto(const uint8_t *jpeg, size_t jpegLen) {
+    if (!jpeg || !jpegLen) return false;
+
+    String url = String("https://api.telegram.org/bot") + cfg.botToken + "/sendPhoto";
+
+    WiFiClientSecure client;
+    client.setCACert(TELEGRAM_ROOT_CA);   // GoDaddy Root G2 (api.telegram.org)
+    client.setTimeout(15000);   // bound the TLS handshake — fail clean, don't stall loop()
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        Serial.println("telegram: begin failed");
+        return false;
+    }
+
+    String ts = clockString();
+    String caption = "🚪 Garage door heard" + (ts.length() ? (" " + ts) : String());
+
+    // Hand-rolled multipart/form-data body (binary JPEG can't go through a
+    // String — NUL bytes). Header parts are text, the JPEG is memcpy'd in.
+    String boundary = "GarageCam" + String(millis(), HEX);
+    String head = "--" + boundary + "\r\n"
+                  "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + String(cfg.chatId) + "\r\n"
+                  "--" + boundary + "\r\n"
+                  "Content-Disposition: form-data; name=\"caption\"\r\n\r\n" + caption + "\r\n"
+                  "--" + boundary + "\r\n"
+                  "Content-Disposition: form-data; name=\"photo\"; filename=\"garagesense.jpg\"\r\n"
+                  "Content-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--" + boundary + "--\r\n";
+
+    size_t total = head.length() + jpegLen + tail.length();
+    uint8_t *body = (uint8_t *)bigMalloc(total);
+    if (!body) { Serial.println("telegram: out of memory for body buffer"); http.end(); return false; }
+    size_t off = 0;
+    memcpy(body, head.c_str(), head.length());   off += head.length();
+    memcpy(body + off, jpeg, jpegLen);           off += jpegLen;
+    memcpy(body + off, tail.c_str(), tail.length());
+
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+    int code = http.POST(body, total);
+    free(body);
+
+    String resp = http.getString();
+    http.end();
+    client.stop();
+
+    if (code != 200) { Serial.printf("telegram HTTP %d: %s\n", code, resp.c_str()); return false; }
+    if (!resp.startsWith("{\"ok\":true")) { Serial.printf("telegram not ok: %s\n", resp.c_str()); return false; }
+    Serial.printf("telegram accepted photo (%u KB)\n", (unsigned)(jpegLen / 1024));
+    return true;
+}
+
+// ============================ door event handler
+
+// Quiet-hours gate: is the schedule currently "on"? (day enabled AND the
+// current hour is toggled on). Fails OPEN when NTP hasn't synced — a lost
+// clock must never silence the dog alerts.
+static bool scheduleActive() {
+    time_t t = time(nullptr);
+    if (t < 1600000000) return true;   // NTP not synced yet — allow the send
+    struct tm lt;
+    localtime_r(&t, &lt);
+    int bit = (lt.tm_wday == 0) ? 6 : (lt.tm_wday - 1);   // tm_wday 0=Sun -> bit6; 1=Mon -> bit0
+    if (!((cfg.daysMask >> bit) & 1)) return false;
+    return ((cfg.hoursMask >> lt.tm_hour) & 1) != 0;      // per-hour on/off
+}
+
+// The motor has stopped, but the door is still settling. Arm a one-shot timer;
+// loop() fires the actual capture when it expires.
+static uint32_t pendingPhotoAt = 0;      // 0 = nothing armed
+static bool pendingPhotoForce = false;
+
+static void handleDoorEvent(const char *why, bool force) {
+    uint32_t now = millis();
+
+    // Quiet-hours schedule (real door events only — manual tests bypass it).
+    if (!force && !scheduleActive()) {
+        static uint32_t lastSchedPrint = 0;
+        if (now - lastSchedPrint > 10000) {
+            Serial.println("door event — schedule off (quiet hours), skipping");
+            lastSchedPrint = now;
+        }
+        return;
+    }
+
+    // Episode tracking: the detector re-fires while the motor keeps running —
+    // that re-fire is the "still running" signal.
+    if (!force) {
+        if ((now - lastEventMs) > EPISODE_GAP_MS) episodeCount = 0;   // quiet long enough => new episode
+        lastEventMs = now;
+    }
+
+    // Send gate: the between-episode cap (COOLDOWN_MS), or — while the episode
+    // is still active and under the per-episode photo cap — the shorter repeat gap.
+    bool allow = force ||
+                 (now - lastSendMs >= cfg.cooldownMs) ||
+                 (now - lastSendMs >= EPISODE_REPEAT_MS && episodeCount < EPISODE_MAX);
+    if (!allow) {
+        // Throttle the "skipping" log so repeated triggers don't spam serial.
+        static uint32_t lastSkipPrint = 0;
+        if (now - lastSkipPrint > 10000) {
+            Serial.printf("door event (%s) throttled — skipping (episode %u/%u)\n", why,
+                          (unsigned)episodeCount, (unsigned)EPISODE_MAX);
+            lastSkipPrint = now;
+        }
+        return;
+    }
+
+    // Gate passed — arm the delayed shot instead of capturing now.
+    lastSendMs = now;
+    pendingPhotoAt = now + DOOR_PHOTO_DELAY_MS;
+    pendingPhotoForce = force;
+    Serial.printf("GARAGE DOOR (%s) — door heard, photo in %lus\n", why,
+                  (unsigned long)(DOOR_PHOTO_DELAY_MS / 1000));
+}
+
+// Fired from loop() once the settling delay has elapsed.
+static void takeDoorPhoto() {
+    uint32_t now = millis();
+    bool force = pendingPhotoForce;
+    pendingPhotoAt = 0;
+
+    working = true;
+    LED_ON();
+    // Wait for home WiFi (bounded, non-blocking) — right after boot it may
+    // still be associating. Tick loopTick so the watchdog stays happy.
+    uint32_t waitStart = millis();
+    while (!WiFi.isConnected() && (millis() - waitStart < 20000)) {
+        loopTick++;   // keep the watchdog fed while we wait
+        delay(100);
+    }
+
+    uint8_t *jpg = nullptr;
+    size_t jpgLen = 0;
+    bool ok = false;
+    if (WiFi.isConnected()) {
+        ok = capturePhoto(&jpg, &jpgLen) && sendTelegramPhoto(jpg, jpgLen);
+    } else {
+        Serial.println("wifi not connected — skipping send");
+    }
+    if (jpg) free(jpg);
+
+    working = false;
+    LED_OFF();
+    lastResult = ok ? "ok" : "fail";
+
+    if (!ok) {
+        // Failed: allow a retry sooner than the full cooldown.
+        uint32_t retry = cfg.cooldownMs < 30000 ? cfg.cooldownMs : 30000;
+        lastSendMs = now - (cfg.cooldownMs > retry ? cfg.cooldownMs - retry : 0);
+        Serial.println("send failed — will retry on the next door cycle");
+    } else {
+        if (!force) episodeCount++;   // count successful photos this episode
+        Serial.printf("photo sent (episode %u/%u)\n", (unsigned)episodeCount, (unsigned)EPISODE_MAX);
+    }
+}
+
+// ============================ config access point (AP + web UI)
+
+static void connectSTA();   // forward decl — startAP calls it below its definition
+static void startAP() {
+    WiFi.mode(WIFI_AP_STA);   // keep home WiFi while serving config — test photos work
+    WiFi.softAP(AP_SSID);   // open AP — local config window
+    apMode = true;          // without this the web UI never runs in AP mode
+    apStartMs = millis();   // ...and the window is measured from this open, not boot
+    static bool mdnsUp = false;
+    if (!mdnsUp) { MDNS.begin("garagesense"); mdnsUp = true; }   // http://garagesense.local
+    apEmptySince = 0;
+    apClientEver = false;   // fresh window: stay open until a client comes and goes
+    server.begin();
+    connectSTA();   // home WiFi in parallel (board stays online while configuring)
+    Serial.printf("config AP '%s' up for %lu min — phone: connect, open http://garagesense.local (or 192.168.4.1)\n",
+                  AP_SSID, (unsigned long)(cfg.apWindowMs / 60000));
+}
+
+static void exitAP() {
+    if (!apMode) return;
+    apMode = false;
+    server.close();   // free the port-80 listener (begin() re-creates it on reopen)
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(true);   // let the radio modem-sleep in normal operation (power/heat)
+}
+
+// ---- OTA ----
+// ArduinoOTA over WiFi. Hostname is derived from the chip MAC so GarageCam and
+// BarkCam can never claim the same mDNS name. Upload from the MacBook with
+//   pio run -t upload --upload-port garagesense.local
+// or over the air with espota / the PlatformIO OTA protocol.
+#define OTA_PASSWORD "garagesense"
+
+static void setupOTA() {
+    char host[24];
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(host, sizeof(host), "garagesense-%04x", (uint16_t)(mac & 0xFFFF));
+    ArduinoOTA.setHostname(host);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([]() { Serial.printf("OTA: start (%s)\n",
+                                             ArduinoOTA.getCommand() == U_FLASH ? "firmware" : "fs"); });
+    ArduinoOTA.onEnd([]() { Serial.println("OTA: done — rebooting"); });
+    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+        static int last = -1;
+        int pct = t ? (int)(p * 100 / t) : 0;
+        if (pct / 10 != last) { last = pct / 10; Serial.printf("OTA: %d%%\n", pct); }
+    });
+    ArduinoOTA.onError([](ota_error_t e) {
+        Serial.printf("OTA error[%u]: %s\n", e,
+            e == OTA_AUTH_ERROR ? "auth" : e == OTA_BEGIN_ERROR ? "begin" :
+            e == OTA_CONNECT_ERROR ? "connect" : e == OTA_RECEIVE_ERROR ? "receive" :
+            "end");
+    });
+    ArduinoOTA.begin();
+    Serial.printf("OTA ready: %s.local (password set)\n", host);
+}
+
+static void connectSTA() {
+    if (!cfg.ssid.length()) return;
+    // Modem-sleep off: on a marginal link (-80 dBm) sleep costs the DHCP
+    // handshake and the TLS upload. Costs ~20 mA, buys a working camera.
+    WiFi.setSleep(false);
+    WiFi.begin(cfg.ssid, cfg.pass);
+}
+
+// Called from loop(): if we have credentials but no IP, re-issue begin() every
+// 30 s. A single begin() at boot can lose the race against a weak AP.
+static void ensureWifi(uint32_t now) {
+    static uint32_t lastTry = 0;
+    if (!cfg.ssid.length() || WiFi.isConnected()) return;
+    if (now - lastTry < 30000) return;
+    lastTry = now;
+    Serial.printf("wifi: retry begin (status %d)\n", WiFi.status());
+    WiFi.disconnect();
+    connectSTA();
+}
+
+static void handleRoot() { server.send_P(200, "text/html", UI_PAGE); }
+
+static float normDb(float db) {
+    float v = (db + 80.0f) / 60.0f;   // -80..-20 dBFS -> 0..1
+    return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
+
+static void handleLevel() {
+    String j = "{\"mode\":\"";
+    j += apMode ? (WiFi.isConnected() ? "config + online" : "config, no wifi") : (WiFi.isConnected() ? "online" : "offline");
+    j += "\",\"db\":" + String(normDb(detector.lastFrameDb()), 2)
+       + ",\"noise\":" + String(normDb(detector.noiseDb()), 2)
+       + ",\"thr\":" + String(normDb(detector.thresholdDb()), 2) + ",\"hist\":[";
+    const float *h = detector.hist();
+    int idx = detector.histIdx();   // oldest first
+    for (int i = 0; i < DoorDetector::HIST_LEN; i++) {
+        if (i) j += ",";
+        j += String(normDb(h[(idx + i) % DoorDetector::HIST_LEN]), 2);
+    }
+    j += "]}";
+    server.send(200, "application/json", j);
+}
+
+static void handleGetConfig() {
+    // The WiFi password and bot token are NEVER serialized to the client.
+    // The page learns only *whether* each is set, never the value. Physical
+    // security covers the rest: the board is inside the mount, and this page
+    // is only reachable during the short post-plug-in window.
+    String j = "{\"ssid\":\"" + cfg.ssid + "\""
+             + ",\"pass\":\"\",\"hasPass\":" + (cfg.pass.length() ? "true" : "false")
+             + ",\"token\":\"\",\"hasToken\":" + (cfg.botToken.length() ? "true" : "false")
+             + ",\"chatId\":\"" + cfg.chatId
+             + "\",\"margin\":" + String(cfg.marginDb, 1)
+             + ",\"rotate\":" + String(cfg.rotate)
+             + ",\"exposure\":" + String(cfg.exposure)
+             + ",\"mirror\":" + String(cfg.mirror)
+             + ",\"apWindowMs\":" + String((uint32_t)cfg.apWindowMs)
+             + ",\"daysMask\":" + String((int)cfg.daysMask)
+             + ",\"hoursMask\":" + String((int)cfg.hoursMask) + "}";
+    server.send(200, "application/json", j);
+}
+
+static void handlePostConfig() {
+    bool changed = false;
+    // Secrets: a blank value means "keep what is stored", not "erase".
+    // The client never receives the stored secrets, so blank is the normal
+    // case whenever the user didn't deliberately retype one.
+    if (server.hasArg("ssid")  && server.arg("ssid").length())  { cfg.ssid = server.arg("ssid"); changed = true; }
+    if (server.hasArg("pass")  && server.arg("pass").length())  { cfg.pass = server.arg("pass"); changed = true; }
+    if (server.hasArg("token") && server.arg("token").length()) { cfg.botToken = server.arg("token"); changed = true; }
+    if (server.hasArg("chatId"))     { cfg.chatId = server.arg("chatId"); changed = true; }
+    if (server.hasArg("margin"))     { cfg.marginDb = server.arg("margin").toFloat(); detector.setMargin(cfg.marginDb); changed = true; }
+    if (server.hasArg("rotate"))     { int v = server.arg("rotate").toInt(); if (v == 0 || v == 3) { cfg.rotate = v; changed = true; } }
+    if (server.hasArg("exposure"))   { int v = server.arg("exposure").toInt(); if (v >= 0 && v <= 2) { cfg.exposure = v; changed = true; } }
+    if (server.hasArg("mirror"))     { int v = server.arg("mirror").toInt(); cfg.mirror = v ? 1 : 0; changed = true; }
+    if (server.hasArg("apWindowMs")) { uint32_t v = server.arg("apWindowMs").toInt(); if (v >= 5000) { cfg.apWindowMs = v; changed = true; } }
+    if (server.hasArg("daysMask"))  { int v = server.arg("daysMask").toInt(); cfg.daysMask = (uint8_t)(v & 0x7F); changed = true; }
+    if (server.hasArg("hoursMask")) { int v = server.arg("hoursMask").toInt(); cfg.hoursMask = (uint32_t)(v & 0xFFFFFF); changed = true; }
+
+    if (changed) { saveConfig(); if (cameraReady) applyCameraTuning(); }
+    Serial.println("config updated via web UI");
+
+    // WiFi changed: reconnect with the new credentials (keep the config AP up).
+    if (apMode && server.hasArg("ssid") && cfg.ssid.length()) {
+        Serial.println("wifi changed — reconnecting");
+        WiFi.disconnect();
+        connectSTA();
+    }
+
+    server.send(200, "application/json", changed ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+static void handlePostTest() {
+    pendingTest = true;
+    lastResult = "pending";
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"test started\"}");
+}
+
+static void handleStatus() {
+    uint32_t now = millis();
+    String j = "{\"mode\":\"";
+    j += apMode ? "ap" : (WiFi.isConnected() ? "sta" : "offline");
+    j += "\",\"rssi\":" + String(WiFi.RSSI())
+       + ",\"cooldownLeftMs\":" + String((now - lastSendMs < cfg.cooldownMs) ? (cfg.cooldownMs - (now - lastSendMs)) : 0)
+       + ",\"pendingTest\":" + (pendingTest ? "true" : "false")
+       + ",\"version\":\"" FW_VERSION "\""
+       + ",\"lastResult\":\"" + lastResult + "\"}";
+    server.send(200, "application/json", j);
+}
+
+static void handleClose() {
+    if (apMode) { Serial.println("config closed via web UI"); exitAP(); }
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void setupWeb() {
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/level", HTTP_GET, handleLevel);
+    server.on("/config", HTTP_GET, handleGetConfig);
+    server.on("/config", HTTP_POST, handlePostConfig);
+    server.on("/test", HTTP_POST, handlePostTest);
+    server.on("/close", HTTP_POST, handleClose);
+    server.on("/status", HTTP_GET, handleStatus);
+}
+
+// ============================ status + watchdog
+
+static void printStatus() {
+    uint32_t now = millis();
+    uint32_t cdLeft = (now - lastSendMs < cfg.cooldownMs) ? (cfg.cooldownMs - (now - lastSendMs)) / 1000 : 0;
+    Serial.printf(
+        "--- garagesense status ---\n"
+        "mode        : %s\n"
+        "noise floor : %6.1f dBFS\n"
+        "threshold   : %6.1f dBFS (margin %.1f)\n"
+        "last frame  : %6.1f dBFS\n"
+        "wifi rssi   : %d dBm  sleep:%s  heap: %u KB  psram free: %u KB\n"
+        "cooldown    : %lu s remaining (cap %lu s)\n"
+        "schedule    : %s (%u/7 days, %u/24 hours on)\n"
+        "episode     : %u/%u photos, last event %lu s ago\n",
+        apMode ? "config AP" : (WiFi.isConnected() ? "sta" : "offline"),
+        detector.noiseDb(),
+        detector.thresholdDb(),
+        detector.marginDb(),
+        detector.lastFrameDb(),
+        WiFi.RSSI(),
+        WiFi.getSleep() ? "on" : "off",
+        (unsigned)(ESP.getFreeHeap() / 1024),
+        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+        (unsigned long)cdLeft,
+        (unsigned long)(cfg.cooldownMs / 1000),
+        scheduleActive() ? "ON" : "off (quiet hours)",
+        (unsigned)__builtin_popcount((unsigned)cfg.daysMask),
+        (unsigned)__builtin_popcount((unsigned)cfg.hoursMask),
+        (unsigned)episodeCount,
+        (unsigned)EPISODE_MAX,
+        (unsigned long)((now - lastEventMs) / 1000));
+    Serial.printf("learned    : %d samples (%s)\n", detector.templateLen(),
+                  detector.templateLen() > 8 ? "matching this door" : "off — any door");
+}
+
+// ---- wifi scan (serial command 'w') — top networks by RSSI
+struct NetInfo { String ssid; int rssi; uint8_t ch; };
+static void wifiScan() {
+    Serial.println("scanning...");
+    int n = WiFi.scanNetworks();   // blocking, a few seconds
+    if (n <= 0) { Serial.println("no networks found"); return; }
+    int m = min(n, 24);
+    static NetInfo nets[24];
+    for (int i = 0; i < m; i++) { nets[i].ssid = WiFi.SSID(i); nets[i].rssi = WiFi.RSSI(i); nets[i].ch = WiFi.channel(i); }
+    for (int i = 1; i < m; i++) {   // insertion sort, best first
+        NetInfo key = nets[i];
+        int j = i - 1;
+        while (j >= 0 && nets[j].rssi < key.rssi) { nets[j + 1] = nets[j]; j--; }
+        nets[j + 1] = key;
+    }
+    for (int i = 0; i < m && i < 12; i++)
+        Serial.printf("%2d. %-24s %3d dBm  ch%u\n", i + 1, nets[i].ssid.c_str(), nets[i].rssi, nets[i].ch);
+}
+
+// ---- over-USB setup (serial command lines) -------------------------------
+// The browser flasher can push WiFi + Telegram settings straight after it
+// flashes, so a buyer's board comes out of the box already configured:
+//
+//   SET <key> <base64-value>     key: ssid | pass | token | chatId
+//   SAVE                         persist + reconnect home WiFi
+//
+// Values are base64 so passwords/tokens containing spaces or commas survive.
+static char cfgLine[1024];
+static size_t cfgLineLen = 0;
+
+static String b64Decode(const String &s) {
+    if (!s.length()) return String();
+    unsigned char out[512];
+    size_t outLen = 0;
+    if (mbedtls_base64_decode(out, sizeof(out) - 1, &outLen,
+                              (const unsigned char *)s.c_str(), s.length()) != 0)
+        return String();
+    out[outLen] = 0;
+    return String((const char *)out, outLen);
+}
+
+static void handleConfigLine(const char *line) {
+    if (strncmp(line, "SET ", 4) == 0) {
+        const char *p = line + 4;
+        const char *sp = strchr(p, ' ');
+        if (!sp) { Serial.println("SET bad"); return; }
+        String key(p, (size_t)(sp - p));
+        String val = b64Decode(String(sp + 1));
+        if      (key == "ssid")   cfg.ssid = val;
+        else if (key == "pass")   cfg.pass = val;
+        else if (key == "token")  cfg.botToken = val;
+        else if (key == "chatId") cfg.chatId = val;
+        else if (key == "rotate") { int v = val.toInt(); if (v == 0 || v == 3) cfg.rotate = v; }
+        else if (key == "margin") { cfg.marginDb = val.toFloat(); detector.setMargin(cfg.marginDb); }
+        else if (key == "exposure") { int v = val.toInt(); if (v >= 0 && v <= 2) cfg.exposure = v; }
+        else if (key == "mirror") { cfg.mirror = val.toInt() ? 1 : 0; }
+        else { Serial.println("SET bad key"); return; }
+        saveConfig();
+        Serial.printf("SET ok %s (%u chars)\n", key.c_str(), (unsigned)val.length());
+    } else if (strcmp(line, "SAVE") == 0) {
+        saveConfig();
+        Serial.println("CONFIG SAVED");
+        if (cfg.ssid.length()) { WiFi.disconnect(); connectSTA(); }
+    } else {
+        Serial.println("unknown command");
+    }
+}
+
+// Single-key test/tuning commands (line-based: the key, then Enter).
+// Line-based on purpose — a SET payload is base64 and full of letters like
+// s/a/i/2, which must never be mistaken for commands.
+static void runSingleKey(char c) {
+    switch (c) {
+        case 't': handleDoorEvent("manual test", true); break;
+        case 's': printStatus(); break;
+        case 'c': lastSendMs = 0; Serial.println("cooldown cleared"); break;
+        case 'w': wifiScan(); break;
+        case 'i': Serial.printf("wifi: ssid=%s ip=%s rssi=%d\n", WiFi.SSID().c_str(),
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI()); break;
+        case 'a': startAP(); Serial.println("config AP reopened"); break;
+        case 'l':
+            if (detector.templateLen() > 8 && !detector.learning()) {
+                // second 'l' while a template exists = re-learn
+                detector.startLearn();
+                Serial.println("LEARN: run the door now — recording this cycle");
+            } else {
+                detector.startLearn();
+                Serial.println("LEARN: run the door now — recording this cycle");
+            }
+            break;
+        case 'L': detector.clearTemplate(); Serial.println("learned door template cleared"); break;
+        case '1': detector.setMargin(detector.marginDb() + 2.0f);
+                  cfg.marginDb = detector.marginDb(); saveConfig();
+                  Serial.printf("threshold margin now %.1f dB\n", detector.marginDb()); break;
+        case '2': detector.setMargin(detector.marginDb() - 2.0f);
+                  cfg.marginDb = detector.marginDb(); saveConfig();
+                  Serial.printf("threshold margin now %.1f dB\n", detector.marginDb()); break;
+        default: Serial.println("unknown key"); break;
+    }
+}
+
+static void watchdogTask(void *) {
+    uint32_t last = loopTick;
+    uint32_t staleMs = 0;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (loopTick != last) { last = loopTick; staleMs = 0; }
+        else                  { staleMs += 1000; }
+        if (staleMs > WATCHDOG_TIMEOUT_MS) {
+            Serial.println("WATCHDOG: loop stalled — rebooting");
+            ESP.restart();
+        }
+    }
+}
+
+// ============================ setup / loop
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(LED_PIN, OUTPUT);
+    LED_OFF();
+
+    loadConfig();
+    loadTemplate();   // learned door envelope, if any
+    detector.begin();
+    detector.setMargin(cfg.marginDb);
+
+    // Mic — always on; continuous listening is the whole point of this device.
+    micReady = initMic();
+
+    // Phase 1: config window (open AP + home WiFi, first N minutes after power-on)
+    setupWeb();
+    startAP();
+
+    // USB CDC settle — keep serving the web UI while we wait, so a phone that
+    // connects in the first seconds still gets its config page.
+    uint32_t t0 = millis();
+    while (millis() - t0 < 3000) { server.handleClient(); delay(50); }
+
+    Serial.println();
+    Serial.printf("=== GARAGESENSE v1 (fw %d) ===\n", FIRMWARE_VERSION);
+    if (micReady) Serial.println("mic ready (PDM 16 kHz)");
+    else          Serial.println("!! MIC INIT FAILED — is the Sense expansion attached? !!");
+
+    xTaskCreatePinnedToCore(watchdogTask, "wd", 2048, nullptr, 1, nullptr, 1);
+
+    setupOTA();
+    Serial.println("commands (then Enter): t=test photo  s=status  c=clear cooldown  i=wifi info  w=scan  a=reopen config AP  1/2=tune  l=learn door  L=clear learned");
+    Serial.println("setup over USB: SET <ssid|pass|token|chatId> <base64> … then SAVE");
+}
+
+void loop() {
+    loopTick++;
+
+    // --- periodic reboot (6 h) — keeps heap fresh for unattended duty ---
+    if (millis() > PERIODIC_REBOOT_MS) { Serial.println("uptime reached — periodic reboot"); ESP.restart(); }
+
+    // --- audio -> detector (always — the web meter needs it in AP mode too) ---
+    if (micReady) {
+        static int16_t frameBuf[FRAME_SAMPLES];
+        static size_t fill = 0;
+        int16_t chunk[256];
+        size_t gotBytes = 0;
+        i2s_read(I2S_PORT, chunk, sizeof(chunk), &gotBytes, pdMS_TO_TICKS(50));
+        size_t n = gotBytes / 2;   // 16-bit samples
+        for (size_t i = 0; i < n; i++) {
+            frameBuf[fill++] = chunk[i];
+            if (fill == FRAME_SAMPLES) {
+                detector.processFrame(frameBuf, millis());
+                fill = 0;
+            }
+        }
+    } else {
+        delay(50);
+    }
+
+    // --- config web UI (AP mode only) ---
+    if (apMode) server.handleClient();
+
+    // --- config window expired -> drop the AP (board stays on home WiFi) ---
+    if (apMode && (millis() - apStartMs >= cfg.apWindowMs)) {
+        Serial.println("config window closed — dropping config AP");
+        exitAP();
+    }
+
+    // --- last config client left -> drop the AP (10 s debounce) ---
+    if (apMode) {
+        if (WiFi.softAPgetStationNum() > 0) { apClientEver = true; apEmptySince = 0; }
+        else if (apClientEver) {
+            if (!apEmptySince) apEmptySince = millis();
+            else if (millis() - apEmptySince > 10000) {
+                Serial.println("config client gone — dropping config AP");
+                apEmptySince = 0;
+                exitAP();
+            }
+        }
+    }
+
+    // --- serial commands (line-based: type the key or command, then Enter) ---
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (cfgLineLen) {
+                cfgLine[cfgLineLen] = 0;
+                if (cfgLineLen == 1) runSingleKey(cfgLine[0]);   // t / s / c / w / i / a / 1 / 2
+                else                 handleConfigLine(cfgLine);   // SET / SAVE
+                cfgLineLen = 0;
+            }
+        } else if (cfgLineLen < sizeof(cfgLine) - 1) {
+            cfgLine[cfgLineLen++] = c;
+        } else {
+            cfgLineLen = 0;   // runaway line — drop it
+        }
+    }
+
+    // --- web test request (handler set the flag) ---
+    if (pendingTest) {
+        pendingTest = false;
+        handleDoorEvent("web test", true);   // sets lastResult ok/fail
+    }
+
+    // --- door cycle? ---
+    if (detector.eventDetected()) handleDoorEvent("door motor", false);
+
+    // --- OTA (only meaningful with an IP) ---
+    if (WiFi.isConnected()) ArduinoOTA.handle();
+
+    // --- Telegram manual trigger (idle only) ---
+    if (WiFi.isConnected() && !working && !pendingPhotoAt) pollTelegramTrigger();
+    if (pendingTelegramPhoto) {
+        pendingTelegramPhoto = false;
+        handleDoorEvent("telegram", true);   // force = bypass quiet hours
+    }
+
+    // --- keep trying a weak link ---
+    ensureWifi(millis());
+
+    // --- armed delayed photo? ---
+    if (pendingPhotoAt && (int32_t)(millis() - pendingPhotoAt) >= 0) takeDoorPhoto();
+
+    // --- learn recording finished? ---
+    if (detector.learnDone()) {
+        int n = detector.commitTemplate();
+        saveTemplate();
+        Serial.printf("LEARN done — captured %d samples, now matching this door\n", n);
+    }
+
+    // --- STA recovery: disconnected too long -> back to config AP ---
+    if (!apMode && WiFi.isConnected()) {
+        everConnected = true;
+        staDiscSince = 0;
+    } else if (!apMode && !WiFi.isConnected()) {
+        uint32_t grace = everConnected ? 60000 : 15000;
+        static uint32_t lastConnLog = 0;
+        if (millis() - lastConnLog > 5000) {
+            lastConnLog = millis();
+            Serial.printf("wifi: not connected (status %d)\n", WiFi.status());
+        }
+        if (!staDiscSince) staDiscSince = millis();
+        else if (millis() - staDiscSince > grace) {
+            Serial.println("wifi lost — reopening config AP");
+            staDiscSince = 0;
+            startAP();
+        }
+    }
+
+    // --- while the config AP is up, keep trying the home network ---
+    // Without this the board sits in AP mode for the whole window with no join
+    // attempt and no feedback, which reads as "broken" to someone setting up.
+    if (apMode && cfg.ssid.length() && !WiFi.isConnected()) {
+        static uint32_t lastApTry = 0;
+        if (millis() - lastApTry > 15000) {
+            lastApTry = millis();
+            Serial.printf("config AP: retrying home wifi (status %d)\n", WiFi.status());
+            connectSTA();
+        }
+    }
+
+    // --- LED: AP = 2 Hz blink, idle listening = 1 Hz, working = solid ---
+    if (!working) {
+        static uint32_t lastBlink = 0;
+        static bool on = false;
+        uint32_t period = apMode ? 250 : 500;
+        if (millis() - lastBlink > period) {
+            on = !on;
+            digitalWrite(LED_PIN, on ? LOW : HIGH);
+            lastBlink = millis();
+        }
+    }
+}
